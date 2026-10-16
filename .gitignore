@@ -1,0 +1,19 @@
+# --- Datos de sesión de Instagram (equivalen a una contraseña) ---
+cookies_sesion.json
+perfil_playwright/
+.env
+datos/
+resumen.xlsx
+enlaces.json
+
+# --- Entorno virtual y archivos de Python ---
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# --- Editor / sistema ---
+.vscode/
+.idea/
+.DS_Store
+*.iml

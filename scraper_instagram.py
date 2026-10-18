@@ -7,11 +7,11 @@ incluidas todas las de un carrusel).
 Uso:
     python scraper_instagram.py nasa
     python scraper_instagram.py nasa --cantidad 30
-    python scraper_instagram.py mi_cuenta --listas --max-lista 50
+    python scraper_instagram.py nasa --listas --max-lista 50
     python scraper_instagram.py            (te pregunta el usuario)
 
---listas guarda los nombres de usuario de seguidores y seguidos, pero SOLO funciona
-con la cuenta con la que iniciaste sesión (tu propia cuenta); en cuentas ajenas se omite.
+--listas guarda los nombres de usuario de seguidores y seguidos de cualquier perfil que tu
+sesión pueda ver (público, o privado que sigues). Hace falta haber iniciado sesión.
 
 Los datos de cada perfil quedan ordenados en su propia carpeta:
     datos/<usuario>/perfil.json
@@ -31,6 +31,7 @@ import os
 import random
 import re
 import time
+from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
@@ -47,7 +48,7 @@ OPCIONES_CONTEXTO = {
 
 # Reconoce líneas como "4.000 publicaciones", "98 M seguidores", "100 following"
 PATRON_STAT = re.compile(
-    r"^([\d.,]+\s?[KkMm]?)\s+(publicaciones|posts|seguidores|followers|seguidos|following)\b",
+    r"^([\d.,]+\s?(?:mil|[KkMm])?)\s+(publicaciones|posts|seguidores|followers|seguidos|following)\b",
     re.IGNORECASE,
 )
 CLAVES_STAT = {
@@ -241,34 +242,176 @@ def es_cuenta_propia(page):
     return page.get_by_text(re.compile(r"^(Editar perfil|Edit profile)$", re.IGNORECASE)).count() > 0
 
 
+# Las listas de la ventana emergente se piden a este servicio interno de Instagram;
+# leer sus respuestas no depende de cómo esté armado el HTML de la ventana.
+PATRON_API_LISTA = re.compile(r"/api/v1/friendships/\d+/(followers|following)/")
+
+
+def escuchar_api_listas(page, tipo):
+    """Empieza a registrar las cuentas que Instagram devuelve al cargar la lista 'tipo'."""
+    registro = {"usuarios": [], "estados": []}
+
+    def al_responder(resp):
+        m = PATRON_API_LISTA.search(resp.url)
+        if not m or m.group(1) != tipo:
+            return
+        registro["estados"].append(resp.status)
+        try:
+            for u in resp.json().get("users", []):
+                nombre = u.get("username")
+                if nombre and nombre not in registro["usuarios"]:
+                    registro["usuarios"].append(nombre)
+        except Exception:
+            pass
+
+    page.on("response", al_responder)
+    return registro, al_responder
+
+
+def asegurar_perfil(page, usuario):
+    """Vuelve al perfil si la página quedó en otra parte (por ejemplo, tras cerrar una lista)."""
+    if not page.url.rstrip("/").endswith(f"/{usuario}"):
+        page.goto(f"https://www.instagram.com/{usuario}/", timeout=60000)
+    try:
+        page.wait_for_selector("header", timeout=30000)
+    except Exception:
+        pass
+
+
+def abrir_lista(page, usuario, tipo):
+    """Intenta abrir la ventana de 'followers' o 'following'. Devuelve cómo lo logró, o None.
+
+    1) clic en el contador de la cabecera ('26 seguidores', '64 seguidos', '12 following'...);
+       el texto debe empezar por un número, así no se pulsa por error el botón 'Siguiendo'
+       ni una frase de la biografía que mencione la palabra. Playwright espera hasta 15 s
+       a que el contador exista.
+    2) enlace con href .../<tipo>/ (por si en tu sesión sí es un enlace)
+    3) abrir directamente la URL /<usuario>/<tipo>/
+    """
+    etiquetas = "seguidores|followers" if tipo == "followers" else "seguidos|following"
+    contador = page.locator("header").get_by_text(
+        re.compile(rf"^[\d.,]+\s?(mil|[KkMm])?\s+({etiquetas})\b", re.IGNORECASE)).first
+    try:
+        contador.click(timeout=15000)
+        return "texto del contador"
+    except Exception:
+        pass
+
+    selector = f"a[href='/{usuario}/{tipo}/'], a[href$='/{usuario}/{tipo}/'], a[href*='/{tipo}/']"
+    try:
+        page.wait_for_selector(selector, timeout=3000)
+        page.locator(selector).first.click()
+        return "enlace"
+    except Exception:
+        pass
+
+    try:
+        page.goto(f"https://www.instagram.com/{usuario}/{tipo}/", timeout=60000)
+        page.wait_for_selector("div[role='dialog']", timeout=10000)
+        return "URL directa"
+    except Exception:
+        asegurar_perfil(page, usuario)   # volver al perfil para que el diagnóstico muestre la página correcta
+        return None
+
+
+def diagnosticar_perfil(page, usuario, tipo):
+    """Guarda una captura y muestra qué está viendo realmente el navegador."""
+    ruta_png = os.path.join(CARPETA_DATOS, usuario, f"debug_{tipo}.png")
+    try:
+        page.screenshot(path=ruta_png)
+    except Exception:
+        pass
+    try:
+        enlaces_follow = page.eval_on_selector_all(
+            "a[href]", "els => els.map(e => e.getAttribute('href')).filter(h => /follow/i.test(h))")
+    except Exception:
+        enlaces_follow = []
+    privada = page.get_by_text(re.compile(r"cuenta es privada|account is private", re.IGNORECASE)).count() > 0
+    print(f"      URL actual: {page.url}")
+    print(f"      Cuenta privada: {'sí' if privada else 'no se detecta'} | enlaces con 'follow': {enlaces_follow[:5]}")
+    print(f"      Captura de diagnóstico: {ruta_png}")
+
+
 def extraer_lista(page, usuario, tipo, maximo):
-    """Abre la lista 'followers' o 'following' y devuelve los nombres de usuario (hasta 'maximo')."""
-    enlace = page.locator(f"a[href$='/{usuario}/{tipo}/'], a[href*='/{tipo}/']")
-    if enlace.count() == 0:
-        print(f"   !! No se encontró el enlace de {tipo}.")
+    """Abre la lista 'followers' o 'following' de un perfil y devuelve sus nombres de usuario.
+
+    Funciona con cualquier perfil que tu sesión pueda ver (público, o privado que sigues).
+    Combina dos fuentes: los enlaces que se ven en la ventana y las respuestas de red que
+    Instagram envía al cargar la lista. Si algo falla, guarda una captura y datos de
+    diagnóstico en datos/<usuario>/debug_<tipo>.png
+    """
+    asegurar_perfil(page, usuario)
+    registro, manejador = escuchar_api_listas(page, tipo)
+
+    via = abrir_lista(page, usuario, tipo)
+    if via is None:
+        page.remove_listener("response", manejador)
+        print(f"   !! No se pudo abrir la lista de {tipo}: no hay enlace ni contador que se pueda pulsar.")
+        diagnosticar_perfil(page, usuario, tipo)
         return []
-    enlace.first.click()
-    dialogo = page.locator("div[role='dialog']").first
-    dialogo.wait_for(timeout=15000)
+    print(f"   -> Lista de {tipo} abierta (vía: {via})")
+
+    # La lista carga con retraso: esperar a que aparezcan enlaces de perfil dentro de un diálogo.
+    selector_lista = "div[role='dialog'] a[href^='/'], div[role='dialog'] a[href*='instagram.com/']"
+    try:
+        page.wait_for_selector(selector_lista, timeout=20000)
+    except Exception:
+        print(f"   !! El diálogo de {tipo} no mostró ninguna cuenta (¿lista vacía, privada o aún cargando?).")
+    dialogo = page.locator("div[role='dialog']").filter(has=page.locator("a[href]")).first
+    if dialogo.count() == 0:
+        dialogo = page.locator("div[role='dialog']").first
     pausa(2, 3)
 
-    vistos, sin_cambio = [], 0
-    while len(vistos) < maximo and sin_cambio < 3:
-        hrefs = dialogo.locator("a[href^='/']").evaluate_all("els => els.map(e => e.getAttribute('href'))")
+    vistos, sin_cambio, hrefs = [], 0, []
+    while len(vistos) < maximo and sin_cambio < 10:
         antes = len(vistos)
+        try:
+            hrefs = dialogo.locator("a[href]").evaluate_all("els => els.map(e => e.getAttribute('href'))")
+        except Exception:
+            hrefs = []
+        candidatos = []
         for h in hrefs:
-            m = re.fullmatch(r"/([A-Za-z0-9._]+)/", h or "")
-            if m and m.group(1) not in RUTAS_RESERVADAS and m.group(1) != usuario \
-                    and m.group(1) not in vistos:
-                vistos.append(m.group(1))
+            ruta = urlparse(h or "").path           # funciona con '/usuario/', '/usuario' y URLs completas
+            m = re.fullmatch(r"/([A-Za-z0-9._]+)/?", ruta)
+            if m:
+                candidatos.append(m.group(1))
+        candidatos += registro["usuarios"]           # lo que llegó por la red
+        for c in candidatos:
+            if c not in RUTAS_RESERVADAS and c != usuario and c not in vistos:
+                vistos.append(c)
         sin_cambio = sin_cambio + 1 if len(vistos) == antes else 0
         print(f"   -> {tipo}: {len(vistos)} cuentas leídas")
-        dialogo.evaluate(JS_SCROLL_DIALOGO)
+        try:
+            dialogo.evaluate(JS_SCROLL_DIALOGO)
+            dialogo.hover(timeout=2000)              # respaldo: rueda del ratón sobre el diálogo
+            page.mouse.wheel(0, 1500)
+        except Exception:
+            pass
         pausa(1.5, 2.5)
+
+    page.remove_listener("response", manejador)
+
+    if not vistos:
+        n_dialogos = page.locator("div[role='dialog']").count()
+        print(f"   !! No se leyó ninguna cuenta de {tipo}. Diálogos: {n_dialogos} "
+              f"| enlaces en el diálogo: {len(hrefs)} | muestra de hrefs: {hrefs[:5]}")
+        print(f"      Respuestas de red de la lista: {registro['estados'] or 'ninguna'} "
+              f"(200 = Instagram respondió; 4xx = rechazó la petición)")
+        diagnosticar_perfil(page, usuario, tipo)
 
     page.keyboard.press("Escape")
     pausa(1, 2)
     return [{"usuario": u, "url": f"https://www.instagram.com/{u}/"} for u in vistos[:maximo]]
+
+
+def abrir_navegador(p):
+    """Google Chrome real si está instalado (como el Selenium del script de tu compañero);
+    si no, el Chromium que trae Playwright."""
+    try:
+        return p.chromium.launch(channel="chrome", headless=False)
+    except Exception:
+        print("Google Chrome no encontrado: se usa el Chromium de Playwright.")
+        return p.chromium.launch(headless=False)
 
 
 def recolectar_enlaces(page, usuario, rutas, cantidad):
@@ -386,7 +529,7 @@ def pedir_argumentos():
     parser.add_argument("--cantidad", type=int, default=CANTIDAD_POR_DEFECTO,
                         help=f"número de publicaciones (por defecto {CANTIDAD_POR_DEFECTO})")
     parser.add_argument("--listas", action="store_true",
-                        help="guardar también seguidores y seguidos (solo en tu propia cuenta)")
+                        help="guardar también las listas de seguidores y seguidos del perfil")
     parser.add_argument("--max-lista", type=int, default=MAX_LISTA_POR_DEFECTO,
                         help=f"máximo de cuentas por lista (por defecto {MAX_LISTA_POR_DEFECTO})")
     args = parser.parse_args()
@@ -405,7 +548,7 @@ def main():
     print(f"Perfil: @{usuario} | Publicaciones: {cantidad} | Carpeta: {rutas['base']}\n")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = abrir_navegador(p)
         try:
             context, page = obtener_contexto(browser)
 
@@ -417,15 +560,15 @@ def main():
                 print(f"   !! No se pudo leer el perfil, se continúa con las publicaciones: {e}")
 
             if listas:
-                    print(f"Extrayendo listas de seguidores/seguidos para @{usuario}...")
-                    for tipo, clave in (("followers", "seguidores"), ("following", "seguidos")):
-                        try:
-                            cuentas = extraer_lista(page, usuario, tipo, max_lista)
-                            with open(rutas[clave], "w", encoding="utf-8") as f:
-                                json.dump(cuentas, f, ensure_ascii=False, indent=4)
-                            print(f"   -> {len(cuentas)} {clave} guardados en {rutas[clave]}")
-                        except Exception as e:
-                            print(f"   !! No se pudo leer la lista de {clave}: {e}")
+                print(f"Extrayendo listas de seguidores/seguidos para @{usuario}...")
+                for tipo, clave in (("followers", "seguidores"), ("following", "seguidos")):
+                    try:
+                        cuentas = extraer_lista(page, usuario, tipo, max_lista)
+                        with open(rutas[clave], "w", encoding="utf-8") as f:
+                            json.dump(cuentas, f, ensure_ascii=False, indent=4)
+                        print(f"   -> {len(cuentas)} {clave} guardados en {rutas[clave]}")
+                    except Exception as e:
+                        print(f"   !! No se pudo leer la lista de {clave}: {e}")
 
             try:
                 enlaces = recolectar_enlaces(page, usuario, rutas, cantidad)
